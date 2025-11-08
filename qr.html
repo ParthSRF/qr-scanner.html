@@ -1,0 +1,159 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Continuous QR scanner → Google Sheet</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Roboto, "Helvetica Neue", Arial; margin: 0; background:#111; color:#eee; display:flex; flex-direction:column; align-items:center; gap:12px; padding:12px; }
+    video { width: 100%; max-width:720px; border-radius:12px; background:black; }
+    #status { font-size:0.95rem; opacity:0.9; }
+    #last { font-weight:700; word-break:break-all; }
+    button { padding:10px 14px; border-radius:8px; border:0; background:#06f; color:white; font-weight:600; }
+  </style>
+</head>
+<body>
+  <h2>Continuous QR scanner (Safari friendly)</h2>
+  <video id="video" autoplay playsinline muted></video>
+  <div id="status">Initializing camera…</div>
+  <div>Last scanned: <span id="last">—</span></div>
+  <div><button id="startBtn">Start Camera</button> <button id="stopBtn">Stop</button></div>
+
+  <!-- hidden canvas for frame processing -->
+  <canvas id="canvas" style="display:none;"></canvas>
+
+  <!-- jsQR from CDN -->
+  <script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.min.js"></script>
+
+  <script>
+  // CONFIG: put your Apps Script URL here (deployed doPost endpoint)
+  const APPS_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbw9mLjXO1wryIIegD9pALK83S2divib-EkbOLV06wo-iv5wVMZMEOiZG6hGQ8KyYEsl/exec"; // ← replace with your deployed script URL
+
+  const video = document.getElementById('video');
+  const canvas = document.getElementById('canvas');
+  const ctx = canvas.getContext('2d');
+  const statusEl = document.getElementById('status');
+  const lastEl = document.getElementById('last');
+  const startBtn = document.getElementById('startBtn');
+  const stopBtn = document.getElementById('stopBtn');
+
+  let stream = null;
+  let scanning = false;
+
+  // prevent duplicate rapid sends: memory of recent codes
+  const recent = new Map(); // code -> timestamp
+  const DUPLICATE_HIDE_MS = 2000; // 2s cooldown for same code
+  const RECENT_CLEAN_MS = 60 * 1000; // keep memory 60s
+
+  async function startCamera() {
+    try {
+      // Request back camera on phones; falls back when not available
+      stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: { ideal: "environment" } },
+        audio: false
+      });
+      video.srcObject = stream;
+      await video.play();
+      statusEl.textContent = "Camera active — scanning...";
+      scanning = true;
+      requestAnimationFrame(scanFrame);
+    } catch (err) {
+      console.error(err);
+      statusEl.textContent = "Camera error: " + (err.message || err);
+    }
+  }
+
+  function stopCamera() {
+    scanning = false;
+    if (stream) {
+      stream.getTracks().forEach(t => t.stop());
+      stream = null;
+    }
+    statusEl.textContent = "Camera stopped.";
+  }
+
+  function cleanRecent() {
+    const now = Date.now();
+    for (const [k, t] of recent) {
+      if (now - t > RECENT_CLEAN_MS) recent.delete(k);
+    }
+  }
+
+  async function scanFrame() {
+    if (!scanning) return;
+    try {
+      const w = video.videoWidth;
+      const h = video.videoHeight;
+      if (w === 0 || h === 0) {
+        requestAnimationFrame(scanFrame);
+        return;
+      }
+      // match canvas size to video
+      canvas.width = w;
+      canvas.height = h;
+      ctx.drawImage(video, 0, 0, w, h);
+      const imageData = ctx.getImageData(0, 0, w, h);
+
+      // decode with jsQR
+      const code = jsQR(imageData.data, w, h, { inversionAttempts: "attemptBoth" });
+      if (code && code.data) {
+        const value = code.data;
+        const now = Date.now();
+        const lastSeen = recent.get(value) || 0;
+        if (now - lastSeen > DUPLICATE_HIDE_MS) {
+          recent.set(value, now);
+          lastEl.textContent = value;
+          statusEl.textContent = "Detected — sending to sheet…";
+          // Send to Google Apps Script
+          postToSheet({ code: value, meta: { ua: navigator.userAgent, ts: new Date().toISOString() } })
+            .then(r => {
+              statusEl.textContent = "Sent: " + (r && r.status === 'ok' ? 'ok' : 'response received');
+            }).catch(err=>{
+              console.error('post error', err);
+              statusEl.textContent = "Send failed: " + (err && err.message ? err.message : err);
+            });
+        }
+      } else {
+        statusEl.textContent = "Scanning…";
+      }
+
+      // housekeeping
+      cleanRecent();
+    } catch (err) {
+      console.error(err);
+      statusEl.textContent = "Scan error: " + err.message;
+    }
+    // loop
+    requestAnimationFrame(scanFrame);
+  }
+
+  async function postToSheet(payload) {
+    if (!APPS_SCRIPT_URL || APPS_SCRIPT_URL.includes('XXXXXXXX')) {
+      throw new Error("APPS_SCRIPT_URL not set — replace in code with your Apps Script URL");
+    }
+    const resp = await fetch(APPS_SCRIPT_URL, {
+      method: 'POST',
+      mode: 'cors',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    if (!resp.ok) {
+      throw new Error('HTTP ' + resp.status);
+    }
+    return resp.json();
+  }
+
+  // buttons
+  startBtn.addEventListener('click', () => {
+    startCamera();
+  });
+  stopBtn.addEventListener('click', () => {
+    stopCamera();
+  });
+
+  // auto-start when page loads (optional)
+  // startCamera();
+
+  </script>
+</body>
+</html>
